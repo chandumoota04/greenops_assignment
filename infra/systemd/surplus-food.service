@@ -1,0 +1,19 @@
+[Unit]
+Description=Surplus food batch register API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=surplus
+EnvironmentFile=/etc/surplus-food.env
+# 2 GB instance shared with Nginx: cap the heap so the JVM never swaps.
+ExecStart=/usr/bin/java -Xms128m -Xmx512m -XX:+UseSerialGC -jar /opt/surplus-food/current/app.jar
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

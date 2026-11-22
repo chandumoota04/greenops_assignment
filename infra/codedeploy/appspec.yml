@@ -1,0 +1,22 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/surplus-food/incoming
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:
+    - location: hooks/stop.sh
+      timeout: 60
+  BeforeInstall:
+    - location: hooks/clean.sh
+      timeout: 30
+  AfterInstall:
+    - location: hooks/configure.sh
+      timeout: 120
+  ApplicationStart:
+    - location: hooks/start.sh
+      timeout: 60
+  ValidateService:
+    - location: hooks/validate.sh
+      timeout: 150

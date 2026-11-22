@@ -1,0 +1,302 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A deployment already running is never cancelled half way.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # The Learner Lab account; the deploy job refuses to run against any other.
+  EXPECTED_ACCOUNT_ID: "337221518279"
+
+jobs:
+  api:
+    name: "CI: API tests and SpotBugs"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: surplus
+          POSTGRES_PASSWORD: surplus
+          POSTGRES_DB: surplus
+        ports: ["55433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U surplus" --health-interval 2s --health-retries 20
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          # Keeps ~/.m2 between runs, keyed on pom.xml, so dependencies are not
+          # downloaded again on every push.
+          cache: maven
+          cache-dependency-path: api/pom.xml
+      # One Maven run for tests and SpotBugs: the second goal reuses the compiled
+      # classes instead of starting Maven and resolving the build again.
+      - name: Build, API tests and SpotBugs + Find Security Bugs
+        run: ./mvnw -B -ntp verify spotbugs:check
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          t = f = e = s = 0
+          for p in glob.glob('target/surefire-reports/TEST-*.xml'):
+              r = ET.parse(p).getroot()
+              t += int(r.get('tests')); f += int(r.get('failures')); e += int(r.get('errors')); s += int(r.get('skipped'))
+          bugs = []
+          try:
+              bugs = list(ET.parse('target/spotbugsXml.xml').getroot().iter('BugInstance'))
+          except (FileNotFoundError, ET.ParseError):
+              pass
+          high = sum(b.get('priority') == '1' for b in bugs)
+          print('### API checks\n')
+          print('| Tool | Result | Status |')
+          print('| --- | --- | --- |')
+          print(f'| JUnit / MockMvc | {t} tests, {f} failed, {e} errors, {s} skipped | {"pass" if t and not f + e else "FAIL"} |')
+          print(f'| SpotBugs 4.9 + FindSecBugs 1.14 | {len(bugs)} findings ({high} high, {len(bugs) - high} medium) | {"pass" if not bugs else "FAIL"} |')
+          for b in bugs:
+              sl = b.find('SourceLine')
+              print(f'| | {b.get("type")} ({b.get("category")}) | {sl.get("sourcepath")}:{sl.get("start")} |')
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: api-reports
+          path: |
+            api/target/surefire-reports/
+            api/target/spotbugsXml.xml
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: api-jar
+          path: api/target/surplus-food-*.jar
+          if-no-files-found: error
+
+  web:
+    name: "CI: frontend lint and build"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Lint (oxlint)
+        run: npx oxlint --format github
+      - name: Production build
+        run: npm run build
+      - name: Summary
+        run: |
+          {
+            echo "### Frontend"
+            echo
+            echo "| Tool | Result | Status |"
+            echo "| --- | --- | --- |"
+            echo "| oxlint $(npx oxlint --version) | 0 errors | pass |"
+            echo "| Vite build | $(du -sh dist | cut -f1) in dist | pass |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist/
+          if-no-files-found: error
+
+  security:
+    name: "CI: dependency, secret and IaC scan"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: mkdir -p reports
+      - name: Dependency vulnerabilities (OSV-Scanner, Maven + npm)
+        run: |
+          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:v2.6.0 \
+            scan source -r --format json --output /src/reports/osv.json /src || echo $? > reports/osv.exit
+          docker run --rm -v "$PWD:/src:ro" ghcr.io/google/osv-scanner:v2.6.0 scan source -r --format table /src || true
+      - name: Secrets in git history (Gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/src" zricethezav/gitleaks:v8.30.1 \
+            git /src --redact --no-banner --report-format json --report-path /src/reports/gitleaks.json || echo $? > reports/gitleaks.exit
+      - name: Terraform misconfiguration (KICS)
+        run: |
+          docker run --rm -v "$PWD:/src" checkmarx/kics:v2.2.0 scan -p /src/infra/terraform \
+            -o /src/reports --output-name kics --report-formats json --no-progress --ci || true
+      - name: Summary and gate
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os
+          osv = json.load(open('reports/osv.json'))
+          vulns = [v['id'] for r in osv.get('results', []) for p in r.get('packages', []) for v in p.get('vulnerabilities', [])]
+          leaks = json.load(open('reports/gitleaks.json')) if os.path.getsize('reports/gitleaks.json') else []
+          kics = json.load(open('reports/kics.json'))
+          sev = kics['severity_counters']
+          print('### Security scans\n')
+          print('| Tool | Findings | Gate | Status |')
+          print('| --- | --- | --- | --- |')
+          print(f'| OSV-Scanner 2.6 (Maven + npm) | {len(vulns)} known vulnerabilities | none allowed | {"pass" if not vulns else "FAIL"} |')
+          print(f'| Gitleaks 8.30 (full history) | {len(leaks)} secrets | none allowed | {"pass" if not leaks else "FAIL"} |')
+          print(f'| KICS 2.2 (Terraform) | {sev["HIGH"] + sev["CRITICAL"]} high, {sev["MEDIUM"]} medium, {sev["LOW"]} low | no high | {"pass" if not sev["HIGH"] + sev["CRITICAL"] else "FAIL"} |')
+          print('\n| KICS severity | Query | Location |\n| --- | --- | --- |')
+          for q in kics['queries']:
+              if q['severity'] in ('CRITICAL', 'HIGH', 'MEDIUM'):
+                  for f in q['files']:
+                      print(f"| {q['severity']} | {q['query_name']} | {f['file_name'].split('/')[-1]}:{f['line']} |")
+          failed = bool(vulns or leaks or sev['HIGH'] + sev['CRITICAL'])
+          open('reports/gate', 'w').write('fail' if failed else 'pass')
+          PY
+          test "$(cat reports/gate)" = pass
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: security-reports
+          path: reports/
+
+  terraform:
+    name: "CI: Terraform format and validate"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.0"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      - name: Summary
+        run: |
+          echo "### Terraform: fmt and validate passed ($(terraform version | head -1))" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: "CD: Terraform apply and CodeDeploy release"
+    needs: [api, web, security, terraform]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Most pushes change only the app. Terraform apply is run only when the
+      # infrastructure code changed; otherwise its outputs are read from state.
+      - name: Check for infrastructure changes
+        id: infra
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            changed=true
+          elif git diff --quiet "$BEFORE" HEAD -- infra/terraform scripts/ec2-bootstrap.sh; then
+            changed=false
+          else
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "Infrastructure changed since $BEFORE: $changed"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Check the AWS account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "$EXPECTED_ACCOUNT_ID" ]; then
+            echo "::error::Credentials belong to account $actual, expected $EXPECTED_ACCOUNT_ID"
+            exit 1
+          fi
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.15.0"
+          terraform_wrapper: false
+      - name: Terraform apply (only if infrastructure changed)
+        working-directory: infra/terraform
+        env:
+          INFRA_CHANGED: ${{ steps.infra.outputs.changed }}
+        run: |
+          terraform init -input=false
+          if [ "$INFRA_CHANGED" = true ]; then
+            terraform apply -input=false -auto-approve
+          else
+            echo "No infrastructure changes; skipping apply"
+          fi
+          {
+            echo "BUCKET=$(terraform output -raw release_bucket)"
+            echo "APP_URL=$(terraform output -raw app_url)"
+            echo "CD_APP=$(terraform output -raw codedeploy_app)"
+            echo "CD_GROUP=$(terraform output -raw deployment_group)"
+          } >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: api-jar
+          path: api/target
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build and upload the release bundle
+        run: |
+          release="${GITHUB_SHA::7}"
+          echo "RELEASE=$release" >> "$GITHUB_ENV"
+          scripts/build-bundle.sh "$release" "$RUNNER_TEMP/bundle.zip"
+          aws s3 cp "$RUNNER_TEMP/bundle.zip" "s3://$BUCKET/releases/$release.zip" --only-show-errors
+      - name: CodeDeploy deployment
+        run: |
+          id=$(aws deploy create-deployment --application-name "$CD_APP" --deployment-group-name "$CD_GROUP" \
+            --s3-location "bucket=$BUCKET,key=releases/$RELEASE.zip,bundleType=zip" \
+            --description "Release $RELEASE" --query deploymentId --output text)
+          echo "DEPLOYMENT_ID=$id" >> "$GITHUB_ENV"
+          echo "Deployment $id started"
+          if ! aws deploy wait deployment-successful --deployment-id "$id"; then
+            aws deploy get-deployment --deployment-id "$id" --query 'deploymentInfo.[status,errorInformation]' --output text
+            aws deploy list-deployment-instances --deployment-id "$id" --query instancesList --output text | \
+              # Backticks are a JMESPath literal, not shell substitution.
+              xargs -I{} aws deploy get-deployment-instance --deployment-id "$id" --instance-id {} \
+                --query 'instanceSummary.lifecycleEvents[?status!=`Succeeded`].[lifecycleEventName,status,diagnostics.message]' --output text
+            exit 1
+          fi
+      - name: Smoke test the public URL
+        run: scripts/smoke-test.sh "$APP_URL" "$RELEASE" | tee smoke.txt
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Release | ${RELEASE:-none} |"
+            echo "| Terraform apply | ${{ steps.infra.outputs.changed == 'true' && 'ran' || 'skipped (no infrastructure change)' }} |"
+            echo "| CodeDeploy deployment | ${DEPLOYMENT_ID:-none} |"
+            echo "| Smoke test | $(tail -1 smoke.txt 2>/dev/null || echo 'not run') |"
+          } >> "$GITHUB_STEP_SUMMARY"

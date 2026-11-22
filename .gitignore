@@ -1,0 +1,22 @@
+# Build output
+api/target/
+web/dist/
+web/node_modules/
+
+# Local environment and secrets
+.env
+*.env
+*.pem
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+*.log

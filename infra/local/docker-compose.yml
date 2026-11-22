@@ -1,0 +1,43 @@
+# Local copy of the EC2 setup: PostgreSQL 16, the Spring Boot API and Nginx
+# with the same site config used on the server.
+name: surplus-food
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: surplus
+      POSTGRES_PASSWORD: surplus
+      POSTGRES_DB: surplus
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "surplus"]
+      interval: 2s
+      retries: 20
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/local/api.Dockerfile
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/surplus
+      DB_USER: surplus
+      DB_PASSWORD: surplus
+      BIND_ADDRESS: 0.0.0.0
+      APP_RELEASE: ${APP_RELEASE:-local}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/local/web.Dockerfile
+    ports:
+      - "8088:80"
+    depends_on:
+      - api
+
+volumes:
+  dbdata:
