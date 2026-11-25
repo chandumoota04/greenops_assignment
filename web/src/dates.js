@@ -9,7 +9,7 @@ export function formatDay(isoDate) {
 export function expiryLabel(days) {
   if (days < 0) return 'Expired'
   if (days === 0) return 'Today'
-  if (days === 1) return 'tomorrow'
+  if (days === 1) return 'due tomorrow'
   return `In ${days} days`
 }
 
